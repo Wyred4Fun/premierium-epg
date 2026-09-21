@@ -1,0 +1,49 @@
+name: Build guide
+
+# Rebuilds a small guide file with just your channels, every 6 hours, and publishes it as the
+# "latest" release. The app's EPG link points at that file.
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Get this repo (the filter script and your channel list)
+        uses: actions/checkout@v4
+
+      - name: Download the big guide
+        run: |
+          curl -fL --retry 3 --retry-delay 10 -o feed.xml.gz \
+            "https://epgshare01.online/epgshare01/epg_ripper_ALL_SOURCES1.xml.gz"
+          ls -l feed.xml.gz
+
+      - name: Shrink it to your channels
+        run: |
+          python3 filter_epg.py.txt --ids channel_ids.txt --feed feed.xml.gz --out epg.xml.gz
+          ls -l epg.xml.gz
+
+      - name: Publish it
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view latest >/dev/null 2>&1 || \
+            gh release create latest --title "Latest guide" --notes "Small guide file, rebuilt automatically."
+          gh release upload latest epg.xml.gz --clobber
+
+      - name: Keep the schedule alive (GitHub pauses idle repos after 60 days)
+        run: |
+          if [ "$(date -u +%u)" = "1" ]; then
+            git config user.name "epg-bot"
+            git config user.email "epg-bot@users.noreply.github.com"
+            date -u > last_run.txt
+            git add last_run.txt
+            git commit -m "keepalive" || true
+            git push || true
+          fi
