@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""
+filter_epg.py - shrink a huge XMLTV guide (like epg_ripper_ALL_SOURCES1.xml.gz) down to just
+the channels in your playlist, and just the days the app shows.
+
+Streams the file (never loads it all), so it copes with a multi-gigabyte guide.
+
+  python3 filter_epg.py --ids channel_ids.txt --feed feed.xml.gz --out epg.xml.gz
+
+  --ids         text file, one playlist tvg-id per line (the IDs your playlist uses)
+  --feed        a guide file, .xml or .xml.gz. Repeat --feed to merge several guides.
+  --out         the small guide to write (.xml.gz)
+  --days-back   keep programmes that ended less than this many hours ago (default 50)
+  --hours-fwd   keep programmes starting within this many hours from now (default 100)
+  --max-desc    cut descriptions to this many characters (default 200)
+
+Matching: a feed channel is kept if its ID equals a playlist ID. If a playlist ID has no exact
+match, a tidied-up comparison is tried (ignoring case, "(src05)" / "(m3u4u)" tags, "@sd", dots,
+dashes and spaces) and the programmes are written out under the PLAYLIST's ID, so the app
+finds them. Only the title and description of each programme are kept.
+"""
+import argparse
+import gzip
+import io
+import re
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+
+TAG_RE = re.compile(r'<(?:programme|channel)[\s>/]')
+CHAN_ATTR = re.compile(r'\bchannel="([^"]*)"')
+ID_ATTR = re.compile(r'\bid="([^"]*)"')
+START_ATTR = re.compile(r'\bstart="([^"]*)"')
+STOP_ATTR = re.compile(r'\bstop="([^"]*)"')
+TITLE_RE = re.compile(r'<title[^>]*>(.*?)</title>', re.S)
+DESC_RE = re.compile(r'<desc[^>]*>(.*?)</desc>', re.S)
+NAME_RE = re.compile(r'<display-name[^>]*>(.*?)</display-name>', re.S)
+TAGS_IN_ID = re.compile(r'\s*\((?:src\d+|m3u4u)\)|@(?:sd|hd)\b', re.I)
+
+
+def normalize(channel_id):
+    """Loose form of an ID used only to find the same channel written differently."""
+    s = TAGS_IN_ID.sub('', channel_id.lower())
+    if '.' in s:
+        base, _, suffix = s.rpartition('.')
+        return re.sub(r'[^a-z0-9]', '', base) + '.' + suffix.strip()
+    return re.sub(r'[^a-z0-9]', '', s)
+
+
+def parse_time(text):
+    """'20260921060000 +0100' -> UTC datetime, or None."""
+    text = (text or '').strip()
+    if len(text) < 14 or not text[:14].isdigit():
+        return None
+    try:
+        dt = datetime(int(text[0:4]), int(text[4:6]), int(text[6:8]),
+                      int(text[8:10]), int(text[10:12]), int(text[12:14]), tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    rest = text[14:].strip()
+    if len(rest) == 5 and rest[0] in '+-' and rest[1:].isdigit():
+        off = timedelta(hours=int(rest[1:3]), minutes=int(rest[3:5]))
+        dt = dt - off if rest[0] == '+' else dt + off
+    return dt
+
+
+def clip(text, limit):
+    """Cut XML-escaped text to about `limit` characters without slicing an entity in half."""
+    if len(text) <= limit:
+        return text
+    text = text[:limit]
+    amp = text.rfind('&')
+    if amp != -1 and ';' not in text[amp:]:
+        text = text[:amp]
+    return text.rstrip() + '...'
+
+
+def open_text(path):
+    raw = open(path, 'rb')
+    head = raw.read(2)
+    raw.seek(0)
+    stream = gzip.GzipFile(fileobj=raw) if head == b'\x1f\x8b' else raw
+    return io.TextIOWrapper(stream, encoding='utf-8', errors='replace', newline=None)
+
+
+def elements(stream):
+    """Yield (kind, text) for every <channel>...</channel> and <programme>...</programme>."""
+    buf = ''
+    while True:
+        chunk = stream.read(1 << 20)
+        if not chunk:
+            break
+        buf += chunk
+        pos = 0
+        while True:
+            m = TAG_RE.search(buf, pos)
+            if not m:
+                # nothing starts in this chunk; keep only a short tail (a tag could straddle the boundary)
+                buf = buf[-32:]
+                break
+            kind = 'programme' if buf.startswith('<programme', m.start()) else 'channel'
+            gt = buf.find('>', m.start())
+            if gt == -1:
+                buf = buf[m.start():]
+                break
+            if buf[gt - 1] == '/':            # self-closing tag
+                yield kind, buf[m.start():gt + 1]
+                pos = gt + 1
+                continue
+            end_tag = '</' + kind + '>'
+            j = buf.find(end_tag, gt)
+            if j == -1:
+                buf = buf[m.start():]
+                break
+            yield kind, buf[m.start():j + len(end_tag)]
+            pos = j + len(end_tag)
+    # leftover buffer is an incomplete element: ignore
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--ids', required=True)
+    ap.add_argument('--feed', action='append', required=True)
+    ap.add_argument('--out', required=True)
+    ap.add_argument('--days-back', type=float, default=50, help='hours of past to keep')
+    ap.add_argument('--hours-fwd', type=float, default=100)
+    ap.add_argument('--max-desc', type=int, default=200)
+    ap.add_argument('--now', help='override the current time (YYYYMMDDHHMMSS), for testing')
+    args = ap.parse_args()
+
+    wanted = []
+    with open(args.ids, encoding='utf-8', errors='replace') as f:
+        for line in f:
+            s = line.strip()
+            if s and s != '(no tvg-id)':
+                wanted.append(s)
+    wanted_set = set(wanted)
+    print('playlist IDs to look for: %d' % len(wanted_set), flush=True)
+
+    now = parse_time(args.now + ' +0000') if args.now else datetime.now(timezone.utc)
+    keep_from = now - timedelta(hours=args.days_back)
+    keep_until = now + timedelta(hours=args.hours_fwd)
+
+    out = gzip.open(args.out, 'wt', encoding='utf-8', compresslevel=9)
+    out.write('<?xml version="1.0" encoding="UTF-8"?>\n<tv generator-info-name="premierium-epg">\n')
+
+    stats = {'exact': 0, 'tidied': 0, 'programmes': 0, 'seen_programmes': 0}
+    t0 = time.time()
+
+    for feed_path in args.feed:
+        print('reading %s ...' % feed_path, flush=True)
+        feed_ids = []
+        names = {}
+        mapping = {}
+        dirty = True                 # channels seen since the mapping was last built
+        written_channels = set()
+        counts = [0, 0]
+
+        def build_mapping():
+            exact = {i for i in feed_ids if i in wanted_set}
+            covered = set(exact)
+            norm_to_playlist = {}
+            for w in wanted:
+                if w not in covered:
+                    norm_to_playlist.setdefault(normalize(w), w)
+            m = {i: i for i in exact}
+            tidied = 0
+            for i in feed_ids:
+                if i in exact:
+                    continue
+                target = norm_to_playlist.get(normalize(i))
+                # a tidied match is only used for a playlist ID that has no exact match anywhere
+                if target is not None and target not in covered:
+                    m[i] = target
+                    tidied += 1
+            counts[0], counts[1] = len(exact), tidied
+            return m
+
+        for kind, el in elements(open_text(feed_path)):
+            if kind == 'channel':
+                im = ID_ATTR.search(el[:el.find('>') + 1])
+                if im:
+                    feed_ids.append(im.group(1))
+                    nm = NAME_RE.search(el)
+                    if nm:
+                        names[im.group(1)] = nm.group(1)
+                    dirty = True
+                continue
+            # a programme
+            if dirty:
+                mapping = build_mapping()
+                dirty = False
+            stats['seen_programmes'] += 1
+            head = el[:el.find('>') + 1]
+            cm = CHAN_ATTR.search(head)
+            if not cm:
+                continue
+            target = mapping.get(cm.group(1))
+            if target is None:
+                continue
+            sm = START_ATTR.search(head)
+            pm = STOP_ATTR.search(head)
+            st = parse_time(sm.group(1)) if sm else None
+            sp = parse_time(pm.group(1)) if pm else None
+            if st is None or sp is None or sp < keep_from or st > keep_until:
+                continue
+            safe_id = target.replace('&', '&amp;').replace('"', '&quot;').replace('<', '&lt;')
+            if target not in written_channels:
+                written_channels.add(target)
+                out.write('<channel id="%s"><display-name>%s</display-name></channel>\n'
+                          % (safe_id, names.get(cm.group(1), safe_id)))
+            tm = TITLE_RE.search(el)
+            dm = DESC_RE.search(el)
+            desc = ''
+            if dm and dm.group(1).strip():
+                desc = '<desc>%s</desc>' % clip(dm.group(1).strip(), args.max_desc)
+            out.write('<programme start="%s" stop="%s" channel="%s"><title>%s</title>%s</programme>\n'
+                      % (sm.group(1), pm.group(1), safe_id, tm.group(1).strip() if tm else 'Untitled', desc))
+            stats['programmes'] += 1
+        if dirty:
+            mapping = build_mapping()
+        stats['exact'] += counts[0]
+        stats['tidied'] += counts[1]
+        print('  channels in this feed: %d | matched exactly: %d | matched after tidy-up: %d'
+              % (len(feed_ids), counts[0], counts[1]), flush=True)
+
+    out.write('</tv>\n')
+    out.close()
+    print('done in %.0fs: kept %d of %d programmes; %d channels matched exactly, %d after tidy-up'
+          % (time.time() - t0, stats['programmes'], stats['seen_programmes'], stats['exact'], stats['tidied']))
+
+
+if __name__ == '__main__':
+    sys.exit(main())
