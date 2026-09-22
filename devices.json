@@ -1,0 +1,7 @@
+{
+  "devices": {
+    "mdarcy": { "number": "P2897", "name": "MDarcy" },
+    "sif":    { "number": "P3430", "name": "Sif" },
+    "darcy":  { "number": "P2571", "name": "Darcy" }
+  }
+}
