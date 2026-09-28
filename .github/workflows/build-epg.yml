@@ -26,7 +26,7 @@ jobs:
 
       - name: Shrink it to your channels
         run: |
-          python3 filter_epg.py.txt --ids channel_ids.txt --feed feed.xml.gz --out epg.xml.gz
+          python3 filter_epg.py.txt --ids channel_ids.txt --feed feed.xml.gz --out epg.xml.gz --max-desc 500
           ls -l epg.xml.gz
 
       - name: Publish it
