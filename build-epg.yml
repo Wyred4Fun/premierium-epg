@@ -1,0 +1,97 @@
+name: Build guide
+
+# Rebuilds a small guide file with just your channels, every 6 hours, and publishes it as the
+# "latest" release. The app's EPG link points at that file.
+# Each run also reads your m3u4u playlist (the PLAYLIST_URL secret) and adds any new guide id
+# from it to the list, so a channel you add in m3u4u gets its guide data with no hand upload.
+# Only the big EPGShare ALL feed is trimmed here: an id that is not in that feed simply matches
+# nothing, so channels on any other guide are left alone (the app fetches those itself).
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Get this repo (the filter script and your channel list)
+        uses: actions/checkout@v4
+
+      - name: Add every guide id from your playlist
+        env:
+          PLAYLIST_URL: ${{ secrets.PLAYLIST_URL }}
+        run: |
+          tr -d '\r' < channel_ids.txt > ids_all.txt
+          if [ -z "$PLAYLIST_URL" ]; then
+            echo "::warning::No PLAYLIST_URL secret yet - using channel_ids.txt only ($(grep -c . ids_all.txt) ids)"
+            exit 0
+          fi
+          if ! curl -fsSL --retry 3 --retry-delay 10 -o playlist.m3u "$PLAYLIST_URL"; then
+            echo "::warning::Could not download your playlist - using channel_ids.txt only ($(grep -c . ids_all.txt) ids)"
+            exit 0
+          fi
+          python3 - <<'PY'
+          import re
+          old = [l.strip() for l in open('ids_all.txt', encoding='utf-8', errors='replace')]
+          old = [l for l in old if l]
+          have = set(old)
+          text = open('playlist.m3u', encoding='utf-8', errors='replace').read()
+          found = re.findall(r'''tvg-id\s*=\s*(?:"([^"]*)"|'([^']*)')''', text, re.I)
+          ids = []
+          for a, b in found:
+              e = (a or b).strip()
+              low = e.lower()
+              if not e or '(m3u4u)' in low or 'dummy' in low or 'no tvg' in low or e.startswith('('):
+                  continue
+              ids.append(e)
+          if len(found) < 100:
+              print(f"::warning::Playlist gave only {len(found)} guide ids (not a real playlist?) - using channel_ids.txt only ({len(old)} ids)")
+              raise SystemExit(0)
+          new = []
+          for e in ids:
+              if e not in have:
+                  have.add(e)
+                  new.append(e)
+          with open('ids_all.txt', 'w', encoding='utf-8') as f:
+              f.write('\n'.join(old + new) + '\n')
+          print(f"Playlist: {len(found)} guide ids, {len(new)} new - list now {len(old) + len(new)} ids (was {len(old)})")
+          for e in new[:50]:
+              print('  new:', e)
+          if len(new) > 50:
+              print(f'  ... and {len(new) - 50} more')
+          PY
+
+      - name: Download the big guide
+        run: |
+          curl -fL --retry 3 --retry-delay 10 -o feed.xml.gz \
+            "https://epgshare01.online/epgshare01/epg_ripper_ALL_SOURCES1.xml.gz"
+          ls -l feed.xml.gz
+
+      - name: Shrink it to your channels
+        run: |
+          python3 filter_epg.py.txt --ids ids_all.txt --feed feed.xml.gz --out epg.xml.gz --max-desc 500
+          ls -l epg.xml.gz
+
+      - name: Publish it
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view latest >/dev/null 2>&1 || \
+            gh release create latest --title "Latest guide" --notes "Small guide file, rebuilt automatically."
+          gh release upload latest epg.xml.gz --clobber
+
+      - name: Keep the schedule alive (GitHub pauses idle repos after 60 days)
+        run: |
+          if [ "$(date -u +%u)" = "1" ]; then
+            git config user.name "epg-bot"
+            git config user.email "epg-bot@users.noreply.github.com"
+            date -u > last_run.txt
+            git add last_run.txt
+            git commit -m "keepalive" || true
+            git push || true
+          fi
