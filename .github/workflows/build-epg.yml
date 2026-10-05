@@ -1,6 +1,7 @@
 name: Build guide
 
-# Rebuilds a small guide file with just your channels, every 6 hours, and publishes it as the
+# Rebuilds a small guide file with just your channels, every hour (at 41 minutes past - GitHub can run
+# a scheduled job late or skip one, so hourly keeps the guide at most an hour or two behind), and publishes it as the
 # "latest" release. The app's EPG link points at that file.
 # Each run also reads your m3u4u playlist (the PLAYLIST_URL secret) and adds any new guide id
 # from it to the list, so a channel you add in m3u4u gets its guide data with no hand upload.
@@ -8,7 +9,7 @@ name: Build guide
 # nothing, so channels on any other guide are left alone (the app fetches those itself).
 on:
   schedule:
-    - cron: '23 */6 * * *'
+    - cron: '41 * * * *'
   workflow_dispatch:
 
 permissions:
